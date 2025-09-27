@@ -4,7 +4,7 @@
 #define __fastcall
 #endif
 #include <subhook.h>
-#include <lz4.h>
+#include <lz4hc.h>
 
 cvar_t* sv_unlag;
 cvar_t* sv_maxunlag;
@@ -144,7 +144,7 @@ public:
     params.origin.z = int(state->origin.z * 32) / 32.f;
 
 
-    params.animtime = BitTime8(state->animtime);
+    params.animtime = state->animtime;
     params.framerate = state->framerate;
     params.controller[0] = state->controller[0];
     params.controller[1] = state->controller[1];
@@ -153,19 +153,19 @@ public:
     params.blending[0] = state->blending[0];
     params.blending[1] = state->blending[1];
 
-    history[id][out_seq % k_MaxHistory] = { out_seq, params };
+    history[id][out_seq & (k_MaxHistory - 1)] = { out_seq, params };
   }
   bool process_anims(int id, uint32_t last_out, uint32_t recv_seq, double lerp, double frametime, player_anim_params_s& params)
   {
     if (recv_seq == last_proccesed_seq)
     {
       //params.m_clOldTime = params.m_clTime;
-      //params.m_clTime += frametime;
     }
+    //params.m_clTime -= 1.f;
     auto processed = false;
     player_ent_hist_params_s* to_lerp = nullptr;
-    size_t end = (last_out) % k_MaxHistory;
-    for (size_t i = (last_out + 1) % k_MaxHistory; i != end; i = (i + 1) % k_MaxHistory)
+    size_t end = (last_out) & (k_MaxHistory - 1);
+    for (size_t i = (last_out + 1) & (k_MaxHistory - 1); i != end; i = (i + 1) & (k_MaxHistory - 1))
     {
       auto& [seq, hist] = history[id][i];
 
@@ -178,12 +178,12 @@ public:
     float target_time = -1;
     if (to_lerp)
     {
-      target_time = to_lerp->animtime - lerp;
+      target_time = to_lerp->animtime - lerp - frametime;
     }
     player_ent_hist_params_s* from_lerp = nullptr;
     player_ent_hist_params_s* max_lerp = nullptr;
 
-    for (size_t i = (last_out + 1) % k_MaxHistory; i != end; i = (i + 1) % k_MaxHistory)
+    for (size_t i = (last_out + 1) & (k_MaxHistory - 1) ; i != end; i = (i + 1) & (k_MaxHistory - 1))
     {
       auto& [seq, hist] = history[id][i];
 
@@ -198,7 +198,7 @@ public:
         continue;
       }
       processed = true;
-      params.sequence = hist.sequence ;
+      params.sequence = hist.sequence;
       params.gaitsequence = hist.gaitsequence;
       params.frame = uint32_t(hist.frame);
 
@@ -211,9 +211,9 @@ public:
       params.angles.z = hist.angles.z;
 
       params.m_clOldTime = params.m_clTime;
-      params.m_clTime = hist.animtime + frametime;
+      params.m_clTime = hist.animtime - frametime;
 
-      params.animtime = hist.animtime;
+      params.animtime = params.m_clTime;
       params.framerate = hist.framerate;
 
       if (params.sequence < 0)
@@ -222,7 +222,7 @@ public:
       // sequence has changed, hold the previous sequence info
       if (params.sequence != params.prevsequence)
       {
-        params.sequencetime = params.animtime + 0.01f;
+        params.sequencetime = params.animtime;
 
         // save current blends to right lerping from last sequence
         for (int i = 0; i < 2; i++)
@@ -316,7 +316,10 @@ void (PutInServer)(edict_t* pEntity)
   auto m_RequestId = MAKE_REQUESTID(PLID);
   PlayerAnimProcessor[host_id - 1] = {};
   cvar_requests[m_RequestId] = &PlayerAnimProcessor[host_id - 1];
-  g_engfuncs.pfnQueryClientCvarValue2(pEntity, "hbf_debug_vis", m_RequestId);
+  if (phf_debug->value)
+  {
+    g_engfuncs.pfnQueryClientCvarValue2(pEntity, "hbf_debug_vis", m_RequestId);
+  }
   RETURN_META(MRES_IGNORED);
 }
 
@@ -376,7 +379,7 @@ void (PlayerPreThinkPre)(edict_t* pEntity)
   frame = &_host_client->frames[frame_index];
   auto cmd = _host_client->lastcmd;
   auto dt = _host_client->netchan.last_received - PlayerAnimProcessor[host_id].lastTimeReceived;
-  if(!dt)
+  if (!dt)
     dt = cmd.msec * 0.001f;
   float clientLatency = frame->ping_time;
 
@@ -417,6 +420,7 @@ void (PlayerPreThinkPre)(edict_t* pEntity)
       UpdateClientAnimParams(client_id, host_id, PlayerAnimProcessor[host_id].processed_params[client_id], dt);
       player_params[client_id] = PlayerAnimProcessor[host_id].processed_params[client_id];
     }
+
     if (can_debug && phf_debug->value == 2)
     {
       auto model = api->GetModel(cl->edict->v.modelindex);
@@ -483,7 +487,7 @@ void StudioEstimateGait(player_anim_params_s& params)
     return;
   }
   if (!est_velocity.x && !est_velocity.y)
-  {  
+  {
     float flYawDiff = flYaw - (double)(int)(360 * (int64_t)(0.0027777778 * flYaw));
 
     if (flYawDiff > 180.0)
@@ -509,9 +513,9 @@ void StudioEstimateGait(player_anim_params_s& params)
     if (dt < 0.25)
       flYawDiff *= params.m_flYawModifier;
 
-     flYawDiff *= dt;
+    flYawDiff *= dt;
 
-     if ((double)(int)abs((int64_t)flYawDiff) < 0.1)
+    if ((double)(int)abs((int64_t)flYawDiff) < 0.1)
       flYawDiff = 0;
 
     params.gaityaw += flYawDiff;
@@ -1170,6 +1174,11 @@ void (SendDebugInfo)(size_t player_index)
 
     }
     auto model = api->GetModel(dst_plr->edict->v.modelindex);
+    if (!model)
+      continue;
+    auto pstudiohdr = (studiohdr_t*)IEngineStudio.Mod_Extradata(model);
+    if (!pstudiohdr)
+      continue;
 
     player_params[player_index] = PlayerAnimProcessor[player_index].processed_params[i];
     size_t numbones = 0;
@@ -1196,7 +1205,7 @@ void (SendDebugInfo)(size_t player_index)
         dst_plr->edict);
 
       nofind = 1;
-      auto pstudiohdr = (studiohdr_t*)IEngineStudio.Mod_Extradata(model);
+
       numbones = pstudiohdr->numbones;
     }
     player_params[player_index].pack_params(i, buffer);
@@ -1206,7 +1215,7 @@ void (SendDebugInfo)(size_t player_index)
 
   size_t worst_size = LZ4_compressBound(buffer.TellPut());
   std::vector<char> output(worst_size);
-  size_t output_size = LZ4_compress_fast(static_cast<const char*>(buffer.Base()), output.data(), buffer.TellPut(), worst_size, 1);
+  size_t output_size = LZ4_compress_HC(static_cast<const char*>(buffer.Base()), output.data(), buffer.TellPut(), worst_size, 9);
 
   buffer.SeekPut(CUtlBuffer::SEEK_HEAD, 0);
   uint32_t w1 = host_plr->netchan.outgoing_sequence;
